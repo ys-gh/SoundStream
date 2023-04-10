@@ -1,14 +1,18 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchaudio
 from torch.utils.data import DataLoader
 from torchaudio.transforms import MelSpectrogram
 from tqdm import tqdm
 
-from net import SoundStream, WaveDiscriminator, STFTDiscriminator
 from dataset import NSynthDataset
-
+from loss import (adversarial_d_loss, adversarial_g_loss, feature_loss,
+                  spectral_reconstruction_loss)
+from net import SoundStream, STFTDiscriminator, WaveDiscriminator
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -31,65 +35,28 @@ def collate_fn(batch):
     lengths = torch.tensor([elem.shape[-1] for elem in batch])
     return nn.utils.rnn.pad_sequence(batch, batch_first=True), lengths
 
-train_dataset = NSynthDataset(audio_dir="./data/nsynth-train.jsonwav/nsynth-train/audio")
+
+train_dataset = NSynthDataset(audio_dir="./toy/train")
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=2)
 sr = train_dataset.sr
 
-valid_dataset = NSynthDataset(audio_dir="./data/nsynth-valid.jsonwav/nsynth-valid/audio")
+valid_dataset = NSynthDataset(audio_dir="./toy/valid")
 valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=2)
 
-test_dataset = NSynthDataset(audio_dir="./data/nsynth-test.jsonwav/nsynth-test/audio")
+test_dataset = NSynthDataset(audio_dir="./toy/test")
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=2)
 
-def adversarial_g_loss(features_stft_disc_G_x, features_wave_disc_G_x, lengths_stft, lengths_wave):
-    wave_disc_names = lengths_wave.keys()
-    
-    stft_loss = F.relu(1-features_stft_disc_G_x[-1]).sum(dim=3).squeeze()/lengths_stft[-1].squeeze()
-    wave_loss = torch.cat([F.relu(1-features_wave_disc_G_x[key][-1]).sum(dim=2).squeeze()/lengths_wave[key][-1].squeeze() for key in wave_disc_names])
-    loss = torch.cat([stft_loss, wave_loss]).mean()
-    
-    return loss
-
-def feature_loss(features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_wave, lengths_stft):
-    wave_disc_names = lengths_wave.keys()
-    
-    stft_loss = torch.stack([((feat_x-feat_G_x).abs().sum(dim=-1)/lengths_stft[i].view(-1,1,1)).sum(dim=-1).sum(dim=-1) for i, (feat_x, feat_G_x) in enumerate(zip(features_stft_disc_x, features_stft_disc_G_x))], dim=1).mean(dim=1, keepdim=True)
-    wave_loss = torch.stack([torch.stack([(feat_x-feat_G_x).abs().sum(dim=-1).sum(dim=-1)/lengths_wave[key][i] for i, (feat_x, feat_G_x) in enumerate(zip(features_wave_disc_x[key], features_wave_disc_G_x[key]))], dim=1) for key in wave_disc_names], dim=2).mean(dim=1)
-    loss = torch.cat([stft_loss, wave_loss], dim=1).mean()
-    
-    return loss
-
-def spectral_reconstruction_loss(x, G_x, eps=1e-4):
-    L = 0
-    for i in range(6,12):
-        s = 2**i
-        alpha_s = (s/2)**0.5
-        melspec = MelSpectrogram(sample_rate=sr, n_fft=s, hop_length=s//4, n_mels=8, wkwargs={"device": device}).to(device)
-        S_x = melspec(x)
-        S_G_x = melspec(G_x)
-        
-        loss = (S_x-S_G_x).abs().sum() + alpha_s*(((torch.log(S_x.abs()+eps)-torch.log(S_G_x.abs()+eps))**2).sum(dim=-2)**0.5).sum()
-        L += loss
-    
-    return L
-
-def adversarial_d_loss(features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_stft, lengths_wave):
-    wave_disc_names = lengths_wave.keys()
-    
-    real_stft_loss = F.relu(1-features_stft_disc_x[-1]).sum(dim=3).squeeze()/lengths_stft[-1].squeeze()
-    real_wave_loss = torch.stack([F.relu(1-features_wave_disc_x[key][-1]).sum(dim=-1).squeeze()/lengths_wave[key][-1].squeeze() for key in wave_disc_names], dim=1)
-    real_loss = torch.cat([real_stft_loss.view(-1,1), real_wave_loss], dim=1).mean()
-    
-    generated_stft_loss = F.relu(1+features_stft_disc_G_x[-1]).sum(dim=-1).squeeze()/lengths_stft[-1].squeeze()
-    generated_wave_loss = torch.stack([F.relu(1+features_wave_disc_G_x[key][-1]).sum(dim=-1).squeeze()/lengths_wave[key][-1].squeeze() for key in wave_disc_names], dim=1)
-    generated_loss = torch.cat([generated_stft_loss.view(-1,1), generated_wave_loss], dim=1).mean()
-    
-    return real_loss + generated_loss
 
 optimizer_g = optim.Adam(soundstream.parameters(), lr=1e-4, betas=(0.5, 0.9))
 optimizer_d = optim.Adam(list(wave_disc.parameters()) + list(stft_disc.parameters()), lr=1e-4, betas=(0.5, 0.9))
 
-criterion_g = lambda x, G_x, features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_wave, lengths_stft: LAMBDA_ADV*adversarial_g_loss(features_stft_disc_G_x, features_wave_disc_G_x, lengths_stft, lengths_wave) + LAMBDA_FEAT*feature_loss(features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_wave, lengths_stft) + LAMBDA_REC*spectral_reconstruction_loss(x, G_x)
+def criterion_g(x, G_x, features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_wave, lengths_stft, sr, dev):
+    adv_g = LAMBDA_ADV*adversarial_g_loss(features_stft_disc_G_x, features_wave_disc_G_x, lengths_stft, lengths_wave)
+    f_loss = LAMBDA_FEAT*feature_loss(features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x, features_wave_disc_G_x, lengths_wave, lengths_stft)
+    spec_loss = LAMBDA_REC*spectral_reconstruction_loss(x, G_x, sr, dev)
+    return  adv_g + f_loss + spec_loss
+
+
 criterion_d = adversarial_d_loss
 
 best_model = soundstream.state_dict().copy()
@@ -234,6 +201,11 @@ for epoch in range(1, N_EPOCHS+1):
             loss_d = criterion_d(features_stft_disc_x, features_wave_disc_x, features_stft_disc_G_x_det, features_wave_disc_G_x_det, lengths_stft, lengths_wave)
             
             test_loss_d += loss_d.item()
+
+            # save audio
+            for i in range(G_x.size(0)):
+                output_file = os.path.join(output_dir, f"epoch_{epoch}_batch_{batch_idx}_sample_{i}.wav")
+                torchaudio.save(output_file, G_x[i].detach().cpu(), sr)
         
         history["test"]["d"].append(test_loss_d/len(test_loader))
         history["test"]["g"].append(test_loss_g/len(test_loader))
